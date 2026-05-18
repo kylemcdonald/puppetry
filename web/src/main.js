@@ -153,6 +153,94 @@ function removeNearCollinear(points, epsilon = 0.015) {
   return out.length >= 3 ? out : points;
 }
 
+function edgeKey(a, b) {
+  return a < b ? `${a}:${b}` : `${b}:${a}`;
+}
+
+function buildEdgeInfo(triangles) {
+  const edges = new Map();
+  triangles.forEach((tri) => {
+    for (const [a, b, opposite] of [
+      [tri[0], tri[1], tri[2]],
+      [tri[1], tri[2], tri[0]],
+      [tri[2], tri[0], tri[1]],
+    ]) {
+      const key = edgeKey(a, b);
+      if (!edges.has(key)) edges.set(key, { a: Math.min(a, b), b: Math.max(a, b), opposites: [] });
+      edges.get(key).opposites.push(opposite);
+    }
+  });
+  return edges;
+}
+
+function oppositeAcross(edges, a, b, exclude) {
+  const edge = edges.get(edgeKey(a, b));
+  if (!edge) return null;
+  return edge.opposites.find((idx) => idx !== exclude) ?? null;
+}
+
+function addScaled(out, point, scale) {
+  out.x += point.x * scale;
+  out.y += point.y * scale;
+}
+
+function butterflyPoint(vertices, edges, a, b) {
+  const edge = edges.get(edgeKey(a, b));
+  const va = vertices[a];
+  const vb = vertices[b];
+  if (!edge || edge.opposites.length !== 2) {
+    return { x: (va.x + vb.x) * 0.5, y: (va.y + vb.y) * 0.5 };
+  }
+  const [c, d] = edge.opposites;
+  const outer = [
+    oppositeAcross(edges, a, c, b),
+    oppositeAcross(edges, b, c, a),
+    oppositeAcross(edges, a, d, b),
+    oppositeAcross(edges, b, d, a),
+  ];
+  if (outer.some((idx) => idx == null)) {
+    return { x: (va.x + vb.x) * 0.5, y: (va.y + vb.y) * 0.5 };
+  }
+  const out = { x: 0, y: 0 };
+  addScaled(out, va, 0.5);
+  addScaled(out, vb, 0.5);
+  addScaled(out, vertices[c], 0.125);
+  addScaled(out, vertices[d], 0.125);
+  outer.forEach((idx) => addScaled(out, vertices[idx], -0.0625));
+  return out;
+}
+
+function butterflySubdivision(mesh, iterations = 1) {
+  let vertices = mesh.vertices.map((p) => ({ x: p.x, y: p.y }));
+  let triangles = mesh.triangles.map((tri) => [...tri]);
+  for (let iteration = 0; iteration < iterations; iteration++) {
+    const edges = buildEdgeInfo(triangles);
+    const edgeVertices = new Map();
+    const nextVertices = vertices.map((p) => ({ x: p.x, y: p.y }));
+    const getEdgeVertex = (a, b) => {
+      const key = edgeKey(a, b);
+      if (!edgeVertices.has(key)) {
+        edgeVertices.set(key, nextVertices.length);
+        nextVertices.push(butterflyPoint(vertices, edges, a, b));
+      }
+      return edgeVertices.get(key);
+    };
+    const nextTriangles = [];
+    for (const [a, b, c] of triangles) {
+      const ab = getEdgeVertex(a, b);
+      const bc = getEdgeVertex(b, c);
+      const ca = getEdgeVertex(c, a);
+      nextTriangles.push([a, ab, ca]);
+      nextTriangles.push([ab, b, bc]);
+      nextTriangles.push([ca, bc, c]);
+      nextTriangles.push([ab, bc, ca]);
+    }
+    vertices = nextVertices;
+    triangles = nextTriangles;
+  }
+  return { vertices, triangles, polygon: mesh.polygon };
+}
+
 function triangulatePolygon(rawPath) {
   let polygon = removeNearCollinear(simplifyPath(rawPath, 7));
   if (polygon.length < 3) return null;
@@ -193,7 +281,7 @@ function triangulatePolygon(rawPath) {
       .filter((tri) => tri.every((idx) => idx != null))
       .filter((tri) => Math.abs(polygonArea(tri.map((idx) => vertices[idx]))) > 1e-4);
     if (vertices.length < 3 || triangles.length < 1) return null;
-    return { vertices, triangles, polygon: boundary };
+    return butterflySubdivision({ vertices, triangles, polygon: boundary }, 1);
   } catch (error) {
     console.warn("Constrained triangulation failed", error);
     return null;
