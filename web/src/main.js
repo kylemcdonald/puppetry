@@ -670,15 +670,18 @@ function restoreHandleSnapshot(mesh, snapshot) {
   }
 }
 
-function buildAndInstallMesh(path, autoHandles = false, handleSnapshot = null) {
+function buildAndInstallMesh(path, autoHandles = false, handleSnapshot = null, preferredMode = null) {
   const mesh = triangulatePolygon(path);
-  if (mesh) installMesh(mesh, autoHandles, handleSnapshot);
+  if (mesh) installMesh(mesh, autoHandles, handleSnapshot, preferredMode);
   else draw();
 }
 
-function scheduleMeshBuild(path, autoHandles = false, handleSnapshot = null) {
+function scheduleMeshBuild(path, autoHandles = false, handleSnapshot = null, preferredMode = null) {
   const pathCopy = path.map((p) => ({ x: p.x, y: p.y }));
-  runAfterNextPaint(() => buildAndInstallMesh(pathCopy, autoHandles, handleSnapshot), "Tessellating mesh...");
+  runAfterNextPaint(
+    () => buildAndInstallMesh(pathCopy, autoHandles, handleSnapshot, preferredMode),
+    "Tessellating mesh...",
+  );
 }
 
 function scheduleDeformationUpdate() {
@@ -699,7 +702,7 @@ function clearShape() {
   draw();
 }
 
-function installMesh(mesh, autoHandles = false, handleSnapshot = null) {
+function installMesh(mesh, autoHandles = false, handleSnapshot = null, preferredMode = null) {
   state.mesh = mesh;
   state.sourcePath = (mesh.sourcePath || mesh.polygon).map((p) => ({ x: p.x, y: p.y }));
   state.deformed = mesh.vertices.map((p) => ({ ...p }));
@@ -729,28 +732,46 @@ function installMesh(mesh, autoHandles = false, handleSnapshot = null) {
   } else {
     restoreHandleSnapshot(mesh, handleSnapshot);
   }
-  setMode(autoHandles ? "move" : handleSnapshot ? state.mode : "anchor");
+  setMode(preferredMode || (autoHandles ? "move" : handleSnapshot ? state.mode : "anchor"));
   updateDeformation();
 }
 
-function examplePath() {
+function exampleShape() {
   const w = canvas.clientWidth;
   const h = canvas.clientHeight;
-  return [
-    { x: w * 0.2, y: h * 0.42 },
-    { x: w * 0.42, y: h * 0.34 },
-    { x: w * 0.72, y: h * 0.38 },
-    { x: w * 0.82, y: h * 0.5 },
-    { x: w * 0.68, y: h * 0.62 },
-    { x: w * 0.36, y: h * 0.6 },
-    { x: w * 0.18, y: h * 0.53 },
+  const leftTip = { x: w * 0.22, y: h * 0.22 };
+  const rightTip = { x: w * 0.82, y: h * 0.22 };
+  const bottomLeftAnchor = { x: w * 0.49, y: h * 0.8 };
+  const bottomRightAnchor = { x: w * 0.55, y: h * 0.8 };
+  const path = [
+    leftTip,
+    { x: w * 0.14, y: h * 0.31 },
+    { x: w * 0.43, y: h * 0.73 },
+    bottomLeftAnchor,
+    bottomRightAnchor,
+    { x: w * 0.61, y: h * 0.73 },
+    { x: w * 0.9, y: h * 0.31 },
+    rightTip,
+    { x: w * 0.56, y: h * 0.62 },
+    { x: w * 0.52, y: h * 0.68 },
+    { x: w * 0.48, y: h * 0.62 },
   ];
+  return {
+    path,
+    handles: {
+      anchors: [bottomLeftAnchor, bottomRightAnchor],
+      controls: [
+        { rest: leftTip, target: leftTip },
+        { rest: rightTip, target: rightTip },
+      ],
+    },
+  };
 }
 
 function loadExample(defer = true) {
-  const path = examplePath();
-  if (defer) scheduleMeshBuild(path, true);
-  else buildAndInstallMesh(path, true);
+  const { path, handles } = exampleShape();
+  if (defer) scheduleMeshBuild(path, false, handles, "move");
+  else buildAndInstallMesh(path, false, handles, "move");
 }
 
 function drawTriangleMesh(vertices, color, fill) {
