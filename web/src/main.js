@@ -76,6 +76,7 @@ const state = {
   camera: { x: 0, y: 0 },
   panning: false,
   panLast: null,
+  hoverVertex: null,
 };
 
 function setStatus(text) {
@@ -98,6 +99,8 @@ function refreshCursor() {
     canvas.style.cursor = "wait";
   } else if (state.draggingControl != null || state.panning) {
     canvas.style.cursor = "grabbing";
+  } else if (state.mode === "move" && state.hoverVertex != null && state.anchors.has(state.hoverVertex)) {
+    canvas.style.cursor = "not-allowed";
   } else {
     canvas.style.cursor = state.mode === "move" ? "grab" : "crosshair";
   }
@@ -618,6 +621,7 @@ function nearestVertex(point, maxDistance = 16) {
 
 function setMode(mode) {
   state.mode = mode;
+  state.hoverVertex = null;
   toolButtons.forEach((button) => button.classList.toggle("active", button.dataset.mode === mode));
   refreshCursor();
 }
@@ -851,11 +855,13 @@ canvas.addEventListener("pointerdown", (event) => {
   if (state.mode === "draw") {
     state.drawing = true;
     state.drawPath = [];
+    state.hoverVertex = null;
     appendDrawPoint(p);
     draw();
     return;
   }
   const near = nearestVertex(p);
+  state.hoverVertex = near;
   if (near == null) {
     if (state.mode === "move") {
       state.panning = true;
@@ -904,6 +910,12 @@ canvas.addEventListener("pointermove", (event) => {
   if (state.draggingControl != null) {
     state.targets.set(state.draggingControl, p);
     updateDeformation();
+    return;
+  }
+  const hoverVertex = state.mode === "move" ? nearestVertex(p) : null;
+  if (state.hoverVertex !== hoverVertex) {
+    state.hoverVertex = hoverVertex;
+    refreshCursor();
   }
 });
 
@@ -921,6 +933,13 @@ canvas.addEventListener("pointerup", (event) => {
   state.draggingControl = null;
   state.panning = false;
   state.panLast = null;
+  state.hoverVertex = state.mode === "move" ? nearestVertex(pointerPoint(event)) : null;
+  refreshCursor();
+});
+
+canvas.addEventListener("pointerleave", () => {
+  if (state.panning || state.draggingControl != null) return;
+  state.hoverVertex = null;
   refreshCursor();
 });
 
