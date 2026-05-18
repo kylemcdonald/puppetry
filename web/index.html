@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ARAP Shape Lab</title>
+  </head>
+  <body>
+    <div id="app">
+      <canvas id="canvas"></canvas>
+      <div class="toolbar" role="toolbar" aria-label="Shape controls">
+        <button class="tool active" data-mode="draw" title="Draw shape" aria-label="Draw shape">
+          <i data-lucide="pencil"></i>
+        </button>
+        <button class="tool" data-mode="anchor" title="Anchor point" aria-label="Anchor point">
+          <i data-lucide="pin"></i>
+        </button>
+        <button class="tool" data-mode="control" title="Control point" aria-label="Control point">
+          <i data-lucide="circle-dot"></i>
+        </button>
+        <button class="tool" data-mode="move" title="Move controls" aria-label="Move controls">
+          <i data-lucide="move"></i>
+        </button>
+        <span class="divider"></span>
+        <button id="meshToggle" class="tool active" title="Toggle mesh" aria-label="Toggle mesh">
+          <i data-lucide="grid"></i>
+        </button>
+        <button id="exampleButton" class="tool" title="Load example" aria-label="Load example">
+          <i data-lucide="rotate-ccw"></i>
+        </button>
+        <button id="clearButton" class="tool" title="Clear" aria-label="Clear">
+          <i data-lucide="trash-2"></i>
+        </button>
+      </div>
+      <div id="status" class="status"></div>
+    </div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
