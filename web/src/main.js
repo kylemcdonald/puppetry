@@ -126,49 +126,76 @@ function removeNearCollinear(points, epsilon = 0.015) {
   return out.length >= 3 ? out : points;
 }
 
-function signedTriangleArea(a, b, c) {
-  return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
-}
-
-function pointInTriangle(p, a, b, c, epsilon = 1e-7) {
-  const ab = signedTriangleArea(a, b, p);
-  const bc = signedTriangleArea(b, c, p);
-  const ca = signedTriangleArea(c, a, p);
-  return ab >= -epsilon && bc >= -epsilon && ca >= -epsilon;
-}
-
-function earClipPolygon(vertices) {
-  const indices = vertices.map((_, i) => i);
-  const triangles = [];
-  let guard = vertices.length * vertices.length;
-  while (indices.length > 3 && guard-- > 0) {
-    let clipped = false;
-    for (let i = 0; i < indices.length; i++) {
-      const prev = indices[(i - 1 + indices.length) % indices.length];
-      const curr = indices[i];
-      const next = indices[(i + 1) % indices.length];
-      const a = vertices[prev];
-      const b = vertices[curr];
-      const c = vertices[next];
-      if (signedTriangleArea(a, b, c) <= 1e-7) continue;
-      let containsOtherVertex = false;
-      for (const idx of indices) {
-        if (idx === prev || idx === curr || idx === next) continue;
-        if (pointInTriangle(vertices[idx], a, b, c)) {
-          containsOtherVertex = true;
-          break;
-        }
-      }
-      if (containsOtherVertex) continue;
-      triangles.push([prev, curr, next]);
-      indices.splice(i, 1);
-      clipped = true;
-      break;
-    }
-    if (!clipped) return null;
+function polygonCentroid(points) {
+  let area2 = 0;
+  let cx = 0;
+  let cy = 0;
+  for (let i = 0; i < points.length; i++) {
+    const a = points[i];
+    const b = points[(i + 1) % points.length];
+    const cross = a.x * b.y - b.x * a.y;
+    area2 += cross;
+    cx += (a.x + b.x) * cross;
+    cy += (a.y + b.y) * cross;
   }
-  if (indices.length === 3) triangles.push([indices[0], indices[1], indices[2]]);
-  return triangles.length ? triangles : null;
+  if (Math.abs(area2) < 1e-7) {
+    return {
+      x: points.reduce((sum, p) => sum + p.x, 0) / points.length,
+      y: points.reduce((sum, p) => sum + p.y, 0) / points.length,
+    };
+  }
+  return { x: cx / (3 * area2), y: cy / (3 * area2) };
+}
+
+function ringScales(boundaryCount) {
+  if (boundaryCount <= 10) return [1, 0.7, 0.43, 0.18];
+  if (boundaryCount <= 28) return [1, 0.64, 0.3];
+  return [1, 0.48];
+}
+
+function buildButterflyControlMesh(boundary) {
+  const center = polygonCentroid(boundary);
+  const scales = ringScales(boundary.length);
+  const vertices = [];
+  const ringIndices = [];
+  for (const scale of scales) {
+    const ring = [];
+    for (const p of boundary) {
+      ring.push(vertices.length);
+      vertices.push({
+        x: center.x + (p.x - center.x) * scale,
+        y: center.y + (p.y - center.y) * scale,
+      });
+    }
+    ringIndices.push(ring);
+  }
+  const triangles = [];
+  for (let r = 0; r < ringIndices.length - 1; r++) {
+    const outer = ringIndices[r];
+    const inner = ringIndices[r + 1];
+    for (let i = 0; i < boundary.length; i++) {
+      const next = (i + 1) % boundary.length;
+      if ((i + r) % 2 === 0) {
+        triangles.push([outer[i], outer[next], inner[next]]);
+        triangles.push([outer[i], inner[next], inner[i]]);
+      } else {
+        triangles.push([outer[i], outer[next], inner[i]]);
+        triangles.push([outer[next], inner[next], inner[i]]);
+      }
+    }
+  }
+  const centerIndex = vertices.length;
+  vertices.push(center);
+  const inner = ringIndices[ringIndices.length - 1];
+  for (let i = 0; i < boundary.length; i++) {
+    triangles.push([inner[i], inner[(i + 1) % boundary.length], centerIndex]);
+  }
+  return {
+    vertices,
+    triangles,
+    polygon: boundary,
+    boundaryCount: boundary.length,
+  };
 }
 
 function edgeKey(a, b) {
@@ -188,7 +215,15 @@ function buildEdgeInfo(triangles) {
       edges.get(key).opposites.push(opposite);
     }
   });
-  return edges;
+  const boundaryNeighbors = new Map();
+  for (const edge of edges.values()) {
+    if (edge.opposites.length !== 1) continue;
+    if (!boundaryNeighbors.has(edge.a)) boundaryNeighbors.set(edge.a, []);
+    if (!boundaryNeighbors.has(edge.b)) boundaryNeighbors.set(edge.b, []);
+    boundaryNeighbors.get(edge.a).push(edge.b);
+    boundaryNeighbors.get(edge.b).push(edge.a);
+  }
+  return { edges, boundaryNeighbors };
 }
 
 function oppositeAcross(edges, a, b, exclude) {
@@ -202,12 +237,29 @@ function addScaled(out, point, scale) {
   out.y += point.y * scale;
 }
 
-function butterflyPoint(vertices, edges, a, b) {
+function boundaryButterflyPoint(vertices, boundaryNeighbors, a, b) {
+  const va = vertices[a];
+  const vb = vertices[b];
+  const prev = (boundaryNeighbors.get(a) || []).find((idx) => idx !== b);
+  const next = (boundaryNeighbors.get(b) || []).find((idx) => idx !== a);
+  if (prev == null || next == null) {
+    return { x: (va.x + vb.x) * 0.5, y: (va.y + vb.y) * 0.5 };
+  }
+  const vp = vertices[prev];
+  const vn = vertices[next];
+  return {
+    x: (9 * va.x + 9 * vb.x - vp.x - vn.x) / 16,
+    y: (9 * va.y + 9 * vb.y - vp.y - vn.y) / 16,
+  };
+}
+
+function butterflyPoint(vertices, topology, a, b) {
+  const { edges, boundaryNeighbors } = topology;
   const edge = edges.get(edgeKey(a, b));
   const va = vertices[a];
   const vb = vertices[b];
   if (!edge || edge.opposites.length !== 2) {
-    return { x: (va.x + vb.x) * 0.5, y: (va.y + vb.y) * 0.5 };
+    return boundaryButterflyPoint(vertices, boundaryNeighbors, a, b);
   }
   const [c, d] = edge.opposites;
   const outer = [
@@ -232,14 +284,14 @@ function butterflySubdivision(mesh, iterations = 1) {
   let vertices = mesh.vertices.map((p) => ({ x: p.x, y: p.y }));
   let triangles = mesh.triangles.map((tri) => [...tri]);
   for (let iteration = 0; iteration < iterations; iteration++) {
-    const edges = buildEdgeInfo(triangles);
+    const topology = buildEdgeInfo(triangles);
     const edgeVertices = new Map();
     const nextVertices = vertices.map((p) => ({ x: p.x, y: p.y }));
     const getEdgeVertex = (a, b) => {
       const key = edgeKey(a, b);
       if (!edgeVertices.has(key)) {
         edgeVertices.set(key, nextVertices.length);
-        nextVertices.push(butterflyPoint(vertices, edges, a, b));
+        nextVertices.push(butterflyPoint(vertices, topology, a, b));
       }
       return edgeVertices.get(key);
     };
@@ -256,26 +308,19 @@ function butterflySubdivision(mesh, iterations = 1) {
     vertices = nextVertices;
     triangles = nextTriangles;
   }
-  return { vertices, triangles, polygon: mesh.polygon };
+  return { vertices, triangles, polygon: mesh.polygon, boundaryCount: mesh.boundaryCount };
 }
 
 function butterflyIterationCount(seedTriangleCount) {
-  let iterations = 1;
-  let triangleCount = seedTriangleCount * 4;
-  while (triangleCount < 260 && iterations < 3) {
-    iterations += 1;
-    triangleCount *= 4;
-  }
-  return iterations;
+  return seedTriangleCount < 28 ? 2 : 1;
 }
 
 function triangulatePolygon(rawPath) {
   let boundary = removeNearCollinear(uniquePoints(simplifyPath(rawPath, 7)));
   if (boundary.length < 3) return null;
   if (polygonArea(boundary) < 0) boundary = boundary.slice().reverse();
-  const triangles = earClipPolygon(boundary);
-  if (!triangles) return null;
-  return butterflySubdivision({ vertices: boundary, triangles, polygon: boundary }, butterflyIterationCount(triangles.length));
+  const controlMesh = buildButterflyControlMesh(boundary);
+  return butterflySubdivision(controlMesh, butterflyIterationCount(controlMesh.triangles.length));
 }
 
 function flattenVertices(vertices) {
@@ -404,13 +449,14 @@ function installMesh(mesh, autoHandles = false) {
   state.solver = null;
   state.dirtySolver = true;
   if (autoHandles) {
-    const left = mesh.vertices
-      .map((p, i) => ({ p, i }))
+    const candidates = mesh.vertices
+      .slice(0, mesh.boundaryCount || mesh.vertices.length)
+      .map((p, i) => ({ p, i }));
+    const left = [...candidates]
       .sort((a, b) => a.p.x - b.p.x)
       .slice(0, 3)
       .map(({ i }) => i);
-    const right = mesh.vertices
-      .map((p, i) => ({ p, i }))
+    const right = [...candidates]
       .sort((a, b) => b.p.x - a.p.x)
       .slice(0, 3)
       .map(({ i }) => i);
