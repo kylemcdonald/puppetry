@@ -18,7 +18,7 @@ const ctx = canvas.getContext("2d");
 const statusEl = document.querySelector("#status");
 const toolButtons = [...document.querySelectorAll(".tool[data-mode]")];
 const meshToggle = document.querySelector("#meshToggle");
-const resolutionSlider = document.querySelector("#resolutionSlider");
+const resolutionToggle = document.querySelector("#resolutionToggle");
 const resolutionValue = document.querySelector("#resolutionValue");
 const exampleButton = document.querySelector("#exampleButton");
 const clearButton = document.querySelector("#clearButton");
@@ -33,20 +33,12 @@ const RESOLUTION_PRESETS = [
     interiorSpacingScale: 1.45,
   },
   {
-    name: "Med",
+    name: "Medium",
     subdivisions: 1,
     douglasPeuckerEpsilon: 5,
     boundaryMaxSegment: 24,
     maxBoundaryPoints: 96,
     interiorSpacingScale: 1,
-  },
-  {
-    name: "High",
-    subdivisions: 2,
-    douglasPeuckerEpsilon: 3.5,
-    boundaryMaxSegment: 18,
-    maxBoundaryPoints: 128,
-    interiorSpacingScale: 0.78,
   },
 ];
 
@@ -78,9 +70,12 @@ const state = {
   wasmReady: false,
   dirtySolver: true,
   lastUpdateMs: 0,
-  meshResolution: Number(resolutionSlider.value),
+  meshResolution: resolutionToggle.checked ? 1 : 0,
   sourcePath: null,
   busy: false,
+  camera: { x: 0, y: 0 },
+  panning: false,
+  panLast: null,
 };
 
 function setStatus(text) {
@@ -101,7 +96,7 @@ function updateResolutionDisplay() {
 function refreshCursor() {
   if (state.busy) {
     canvas.style.cursor = "wait";
-  } else if (state.draggingControl != null) {
+  } else if (state.draggingControl != null || state.panning) {
     canvas.style.cursor = "grabbing";
   } else {
     canvas.style.cursor = state.mode === "move" ? "grab" : "crosshair";
@@ -111,7 +106,7 @@ function refreshCursor() {
 function setBusy(busy, message = "") {
   state.busy = busy;
   document.body.classList.toggle("busy", busy);
-  resolutionSlider.disabled = busy;
+  resolutionToggle.disabled = busy;
   if (message) setStatus(message);
   refreshCursor();
 }
@@ -142,6 +137,11 @@ function resizeCanvas() {
 }
 
 function pointerPoint(event) {
+  const p = screenPoint(event);
+  return { x: p.x - state.camera.x, y: p.y - state.camera.y };
+}
+
+function screenPoint(event) {
   const rect = canvas.getBoundingClientRect();
   return { x: event.clientX - rect.left, y: event.clientY - rect.top };
 }
@@ -175,6 +175,10 @@ function polygonArea(points) {
     area += a.x * b.y - b.x * a.y;
   }
   return area * 0.5;
+}
+
+function positiveShell(points) {
+  return polygonArea(points) < 0 ? points.slice().reverse() : points;
 }
 
 function removeClosingDuplicate(points, epsilon = 1) {
@@ -512,9 +516,8 @@ function butterflySubdivision(mesh, iterations = 1) {
 
 function triangulatePolygon(rawPath, resolution = state.meshResolution) {
   const preset = resolutionPreset(resolution);
-  let boundary = simplifyDrawnBoundary(rawPath, preset);
+  const boundary = positiveShell(simplifyDrawnBoundary(rawPath, preset));
   if (boundary.length < 3) return null;
-  if (polygonArea(boundary) < 0) boundary = boundary.slice().reverse();
   const controlMesh = buildButterflyControlMesh(boundary, preset);
   const mesh = butterflySubdivision(controlMesh, preset.subdivisions);
   mesh.sourcePath = rawPath.map((p) => ({ x: p.x, y: p.y }));
@@ -828,6 +831,8 @@ function drawDrawPath() {
 
 function draw() {
   ctx.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
+  ctx.save();
+  ctx.translate(state.camera.x, state.camera.y);
   if (state.mesh) {
     const rest = state.mesh.vertices;
     const deformed = state.deformed.length ? state.deformed : rest;
@@ -836,6 +841,7 @@ function draw() {
     drawHandles();
   }
   drawDrawPath();
+  ctx.restore();
 }
 
 canvas.addEventListener("pointerdown", (event) => {
@@ -850,7 +856,14 @@ canvas.addEventListener("pointerdown", (event) => {
     return;
   }
   const near = nearestVertex(p);
-  if (near == null) return;
+  if (near == null) {
+    if (state.mode === "move") {
+      state.panning = true;
+      state.panLast = screenPoint(event);
+      refreshCursor();
+    }
+    return;
+  }
   if (state.controls.has(near)) {
     state.draggingControl = near;
     canvas.style.cursor = "grabbing";
@@ -875,6 +888,14 @@ canvas.addEventListener("pointerdown", (event) => {
 
 canvas.addEventListener("pointermove", (event) => {
   if (state.busy) return;
+  if (state.panning) {
+    const p = screenPoint(event);
+    state.camera.x += p.x - state.panLast.x;
+    state.camera.y += p.y - state.panLast.y;
+    state.panLast = p;
+    draw();
+    return;
+  }
   const p = pointerPoint(event);
   if (state.drawing) {
     if (appendDrawPoint(p)) draw();
@@ -898,6 +919,8 @@ canvas.addEventListener("pointerup", (event) => {
     scheduleMeshBuild(path);
   }
   state.draggingControl = null;
+  state.panning = false;
+  state.panLast = null;
   refreshCursor();
 });
 
@@ -914,12 +937,9 @@ meshToggle.addEventListener("click", () => {
   draw();
 });
 
-resolutionSlider.addEventListener("input", () => {
-  state.meshResolution = Number(resolutionSlider.value);
+resolutionToggle.addEventListener("change", () => {
+  state.meshResolution = resolutionToggle.checked ? 1 : 0;
   updateResolutionDisplay();
-});
-
-resolutionSlider.addEventListener("change", () => {
   if (!state.sourcePath || state.busy) return;
   scheduleMeshBuild(state.sourcePath, false, captureHandleSnapshot());
 });
