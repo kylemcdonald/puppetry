@@ -25,6 +25,11 @@
         <button id="meshToggle" class="tool active" title="Toggle mesh" aria-label="Toggle mesh">
           <i data-lucide="grid"></i>
         </button>
+        <label class="resolution-control" title="Mesh resolution">
+          <i data-lucide="sliders-horizontal"></i>
+          <input id="resolutionSlider" type="range" min="0" max="2" step="1" value="1" aria-label="Mesh resolution" />
+          <output id="resolutionValue" for="resolutionSlider">Med</output>
+        </label>
         <button id="exampleButton" class="tool" title="Load example" aria-label="Load example">
           <i data-lucide="rotate-ccw"></i>
         </button>

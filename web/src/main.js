@@ -5,6 +5,7 @@ import {
   Pencil,
   Pin,
   RotateCcw,
+  SlidersHorizontal,
   Trash2,
   createIcons,
 } from "lucide";
@@ -17,12 +18,37 @@ const ctx = canvas.getContext("2d");
 const statusEl = document.querySelector("#status");
 const toolButtons = [...document.querySelectorAll(".tool[data-mode]")];
 const meshToggle = document.querySelector("#meshToggle");
+const resolutionSlider = document.querySelector("#resolutionSlider");
+const resolutionValue = document.querySelector("#resolutionValue");
 const exampleButton = document.querySelector("#exampleButton");
 const clearButton = document.querySelector("#clearButton");
 const DRAW_SAMPLE_SPACING = 4;
-const DOUGLAS_PEUCKER_EPSILON = 5;
-const BOUNDARY_MAX_SEGMENT = 24;
-const MAX_BOUNDARY_POINTS = 96;
+const RESOLUTION_PRESETS = [
+  {
+    name: "Low",
+    subdivisions: 0,
+    douglasPeuckerEpsilon: 7,
+    boundaryMaxSegment: 34,
+    maxBoundaryPoints: 48,
+    interiorSpacingScale: 1.45,
+  },
+  {
+    name: "Med",
+    subdivisions: 1,
+    douglasPeuckerEpsilon: 5,
+    boundaryMaxSegment: 24,
+    maxBoundaryPoints: 96,
+    interiorSpacingScale: 1,
+  },
+  {
+    name: "High",
+    subdivisions: 2,
+    douglasPeuckerEpsilon: 3.5,
+    boundaryMaxSegment: 18,
+    maxBoundaryPoints: 128,
+    interiorSpacingScale: 0.78,
+  },
+];
 
 createIcons({
   icons: {
@@ -32,6 +58,7 @@ createIcons({
     Pencil,
     Pin,
     RotateCcw,
+    SlidersHorizontal,
     Trash2,
   },
 });
@@ -51,10 +78,58 @@ const state = {
   wasmReady: false,
   dirtySolver: true,
   lastUpdateMs: 0,
+  meshResolution: Number(resolutionSlider.value),
+  sourcePath: null,
+  busy: false,
 };
 
 function setStatus(text) {
   statusEl.textContent = text;
+}
+
+function resolutionPreset(value = state.meshResolution) {
+  const index = Math.max(0, Math.min(RESOLUTION_PRESETS.length - 1, Math.round(value)));
+  return RESOLUTION_PRESETS[index];
+}
+
+function updateResolutionDisplay() {
+  const preset = resolutionPreset();
+  resolutionValue.value = preset.name;
+  resolutionValue.textContent = preset.name;
+}
+
+function refreshCursor() {
+  if (state.busy) {
+    canvas.style.cursor = "wait";
+  } else if (state.draggingControl != null) {
+    canvas.style.cursor = "grabbing";
+  } else {
+    canvas.style.cursor = state.mode === "move" ? "grab" : "crosshair";
+  }
+}
+
+function setBusy(busy, message = "") {
+  state.busy = busy;
+  document.body.classList.toggle("busy", busy);
+  resolutionSlider.disabled = busy;
+  if (message) setStatus(message);
+  refreshCursor();
+}
+
+function runAfterNextPaint(task, message) {
+  setBusy(true, message);
+  requestAnimationFrame(() => {
+    setTimeout(() => {
+      try {
+        task();
+      } catch (error) {
+        console.error(error);
+        setStatus("Update failed");
+      } finally {
+        setBusy(false);
+      }
+    }, 0);
+  });
 }
 
 function resizeCanvas() {
@@ -205,12 +280,12 @@ function subdivideLongBoundarySegments(points, maxSegmentLength, maxPoints) {
   return out;
 }
 
-function simplifyDrawnBoundary(points) {
+function simplifyDrawnBoundary(points, preset) {
   const cleaned = dedupeConsecutivePoints(points);
   if (cleaned.length < 3) return cleaned;
   const dense = densifyClosedPath(cleaned, DRAW_SAMPLE_SPACING);
-  const simplified = removeNearCollinear(douglasPeuckerClosed(dense, DOUGLAS_PEUCKER_EPSILON));
-  return subdivideLongBoundarySegments(simplified, BOUNDARY_MAX_SEGMENT, MAX_BOUNDARY_POINTS);
+  const simplified = removeNearCollinear(douglasPeuckerClosed(dense, preset.douglasPeuckerEpsilon));
+  return subdivideLongBoundarySegments(simplified, preset.boundaryMaxSegment, preset.maxBoundaryPoints);
 }
 
 function removeNearCollinear(points, epsilon = 0.015) {
@@ -285,14 +360,14 @@ function boundaryBounds(boundary) {
   );
 }
 
-function interiorSampleSpacing(boundary) {
+function interiorSampleSpacing(boundary, preset) {
   const area = Math.max(1, Math.abs(polygonArea(boundary)));
-  return Math.max(34, Math.min(58, Math.sqrt(area) / 6));
+  return Math.max(30, Math.min(68, (Math.sqrt(area) / 6) * preset.interiorSpacingScale));
 }
 
-function addInteriorSamples(vertices, boundary) {
+function addInteriorSamples(vertices, boundary, preset) {
   const box = boundaryBounds(boundary);
-  const spacing = interiorSampleSpacing(boundary);
+  const spacing = interiorSampleSpacing(boundary, preset);
   const rowHeight = spacing * Math.sqrt(3) * 0.5;
   const clearance = spacing * 0.38;
   let row = 0;
@@ -308,9 +383,9 @@ function addInteriorSamples(vertices, boundary) {
   }
 }
 
-function buildButterflyControlMesh(boundary) {
+function buildButterflyControlMesh(boundary, preset) {
   const vertices = boundary.map((p) => ({ x: p.x, y: p.y }));
-  addInteriorSamples(vertices, boundary);
+  addInteriorSamples(vertices, boundary, preset);
   const points = vertices.map((p) => [p.x, p.y]);
   const edges = boundary.map((_, i) => [i, (i + 1) % boundary.length]);
   const triangles = cdt2d(points, edges, { exterior: false, delaunay: true });
@@ -435,16 +510,17 @@ function butterflySubdivision(mesh, iterations = 1) {
   return { vertices, triangles, polygon: mesh.polygon, boundaryCount: mesh.boundaryCount };
 }
 
-function butterflyIterationCount(seedTriangleCount) {
-  return seedTriangleCount < 28 ? 2 : 1;
-}
-
-function triangulatePolygon(rawPath) {
-  let boundary = simplifyDrawnBoundary(rawPath);
+function triangulatePolygon(rawPath, resolution = state.meshResolution) {
+  const preset = resolutionPreset(resolution);
+  let boundary = simplifyDrawnBoundary(rawPath, preset);
   if (boundary.length < 3) return null;
   if (polygonArea(boundary) < 0) boundary = boundary.slice().reverse();
-  const controlMesh = buildButterflyControlMesh(boundary);
-  return butterflySubdivision(controlMesh, butterflyIterationCount(controlMesh.triangles.length));
+  const controlMesh = buildButterflyControlMesh(boundary, preset);
+  const mesh = butterflySubdivision(controlMesh, preset.subdivisions);
+  mesh.sourcePath = rawPath.map((p) => ({ x: p.x, y: p.y }));
+  mesh.resolution = resolution;
+  mesh.resolutionName = preset.name;
+  return mesh;
 }
 
 function flattenVertices(vertices) {
@@ -493,7 +569,7 @@ function updateDeformation() {
   if (!state.mesh) return;
   if (state.dirtySolver && !compileSolver()) {
     state.deformed = state.mesh.vertices.map((p) => ({ ...p }));
-    setStatus(`${state.mesh.vertices.length} vertices`);
+    setStatus(`${state.mesh.vertices.length} vertices · ${state.mesh.resolutionName || resolutionPreset().name}`);
     draw();
     return;
   }
@@ -517,7 +593,7 @@ function updateDeformation() {
     state.deformed.push({ x: result[i], y: result[i + 1] });
   }
   setStatus(
-    `${state.mesh.vertices.length} vertices · ${state.mesh.triangles.length} triangles · ${state.lastUpdateMs.toFixed(2)} ms`,
+    `${state.mesh.vertices.length} vertices · ${state.mesh.triangles.length} triangles · ${state.mesh.resolutionName || resolutionPreset().name} · ${state.lastUpdateMs.toFixed(2)} ms`,
   );
   draw();
 }
@@ -540,7 +616,7 @@ function nearestVertex(point, maxDistance = 16) {
 function setMode(mode) {
   state.mode = mode;
   toolButtons.forEach((button) => button.classList.toggle("active", button.dataset.mode === mode));
-  canvas.style.cursor = mode === "move" ? "grab" : "crosshair";
+  refreshCursor();
 }
 
 function toggleVertex(set, idx) {
@@ -549,6 +625,64 @@ function toggleVertex(set, idx) {
   } else {
     set.add(idx);
   }
+}
+
+function nearestIndexIn(vertices, point, used) {
+  let best = null;
+  let bestDistance = Infinity;
+  vertices.forEach((p, index) => {
+    if (used?.has(index)) return;
+    const d = dist(point, p);
+    if (d < bestDistance) {
+      bestDistance = d;
+      best = index;
+    }
+  });
+  return best;
+}
+
+function captureHandleSnapshot() {
+  if (!state.mesh) return null;
+  return {
+    anchors: [...state.anchors].map((idx) => ({ ...state.mesh.vertices[idx] })),
+    controls: [...state.controls].map((idx) => ({
+      rest: { ...state.mesh.vertices[idx] },
+      target: { ...(state.targets.get(idx) || state.mesh.vertices[idx]) },
+    })),
+  };
+}
+
+function restoreHandleSnapshot(mesh, snapshot) {
+  if (!snapshot) return;
+  const used = new Set();
+  for (const point of snapshot.anchors) {
+    const idx = nearestIndexIn(mesh.vertices, point, used);
+    if (idx == null) continue;
+    used.add(idx);
+    state.anchors.add(idx);
+  }
+  for (const control of snapshot.controls) {
+    const idx = nearestIndexIn(mesh.vertices, control.rest, used);
+    if (idx == null) continue;
+    used.add(idx);
+    state.controls.add(idx);
+    state.targets.set(idx, control.target);
+  }
+}
+
+function buildAndInstallMesh(path, autoHandles = false, handleSnapshot = null) {
+  const mesh = triangulatePolygon(path);
+  if (mesh) installMesh(mesh, autoHandles, handleSnapshot);
+  else draw();
+}
+
+function scheduleMeshBuild(path, autoHandles = false, handleSnapshot = null) {
+  const pathCopy = path.map((p) => ({ x: p.x, y: p.y }));
+  runAfterNextPaint(() => buildAndInstallMesh(pathCopy, autoHandles, handleSnapshot), "Tessellating mesh...");
+}
+
+function scheduleDeformationUpdate() {
+  runAfterNextPaint(updateDeformation, "Updating constraints...");
 }
 
 function clearShape() {
@@ -560,12 +694,14 @@ function clearShape() {
   state.solver = null;
   state.dirtySolver = true;
   state.drawPath = [];
+  state.sourcePath = null;
   setStatus("");
   draw();
 }
 
-function installMesh(mesh, autoHandles = false) {
+function installMesh(mesh, autoHandles = false, handleSnapshot = null) {
   state.mesh = mesh;
+  state.sourcePath = (mesh.sourcePath || mesh.polygon).map((p) => ({ x: p.x, y: p.y }));
   state.deformed = mesh.vertices.map((p) => ({ ...p }));
   state.anchors.clear();
   state.controls.clear();
@@ -590,15 +726,17 @@ function installMesh(mesh, autoHandles = false) {
       const p = mesh.vertices[idx];
       state.targets.set(idx, { x: p.x + 90, y: p.y - 35 + (p.y % 40) * 0.35 });
     });
+  } else {
+    restoreHandleSnapshot(mesh, handleSnapshot);
   }
-  setMode(autoHandles ? "move" : "anchor");
+  setMode(autoHandles ? "move" : handleSnapshot ? state.mode : "anchor");
   updateDeformation();
 }
 
-function loadExample() {
+function examplePath() {
   const w = canvas.clientWidth;
   const h = canvas.clientHeight;
-  const path = [
+  return [
     { x: w * 0.2, y: h * 0.42 },
     { x: w * 0.42, y: h * 0.34 },
     { x: w * 0.72, y: h * 0.38 },
@@ -607,8 +745,12 @@ function loadExample() {
     { x: w * 0.36, y: h * 0.6 },
     { x: w * 0.18, y: h * 0.53 },
   ];
-  const mesh = triangulatePolygon(path);
-  if (mesh) installMesh(mesh, true);
+}
+
+function loadExample(defer = true) {
+  const path = examplePath();
+  if (defer) scheduleMeshBuild(path, true);
+  else buildAndInstallMesh(path, true);
 }
 
 function drawTriangleMesh(vertices, color, fill) {
@@ -676,6 +818,7 @@ function draw() {
 }
 
 canvas.addEventListener("pointerdown", (event) => {
+  if (state.busy) return;
   canvas.setPointerCapture(event.pointerId);
   const p = pointerPoint(event);
   if (state.mode === "draw") {
@@ -697,17 +840,20 @@ canvas.addEventListener("pointerdown", (event) => {
     state.targets.delete(near);
     toggleVertex(state.anchors, near);
     state.dirtySolver = true;
-    updateDeformation();
+    draw();
+    scheduleDeformationUpdate();
   } else if (state.mode === "control") {
     state.anchors.delete(near);
     toggleVertex(state.controls, near);
     if (state.controls.has(near)) state.targets.set(near, state.deformed[near] || state.mesh.vertices[near]);
     state.dirtySolver = true;
-    updateDeformation();
+    draw();
+    scheduleDeformationUpdate();
   }
 });
 
 canvas.addEventListener("pointermove", (event) => {
+  if (state.busy) return;
   const p = pointerPoint(event);
   if (state.drawing) {
     if (appendDrawPoint(p)) draw();
@@ -720,34 +866,53 @@ canvas.addEventListener("pointermove", (event) => {
 });
 
 canvas.addEventListener("pointerup", (event) => {
-  canvas.releasePointerCapture(event.pointerId);
+  if (state.busy) return;
+  if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
   if (state.drawing) {
     state.drawing = false;
     appendDrawPoint(pointerPoint(event));
-    const mesh = triangulatePolygon(state.drawPath);
+    const path = state.drawPath.map((p) => ({ x: p.x, y: p.y }));
     state.drawPath = [];
-    if (mesh) installMesh(mesh);
-    else draw();
+    draw();
+    scheduleMeshBuild(path);
   }
   state.draggingControl = null;
-  canvas.style.cursor = state.mode === "move" ? "grab" : "crosshair";
+  refreshCursor();
 });
 
 toolButtons.forEach((button) => {
-  button.addEventListener("click", () => setMode(button.dataset.mode));
+  button.addEventListener("click", () => {
+    if (!state.busy) setMode(button.dataset.mode);
+  });
 });
 
 meshToggle.addEventListener("click", () => {
+  if (state.busy) return;
   state.showMesh = !state.showMesh;
   meshToggle.classList.toggle("active", state.showMesh);
   draw();
 });
 
-exampleButton.addEventListener("click", loadExample);
-clearButton.addEventListener("click", clearShape);
+resolutionSlider.addEventListener("input", () => {
+  state.meshResolution = Number(resolutionSlider.value);
+  updateResolutionDisplay();
+});
+
+resolutionSlider.addEventListener("change", () => {
+  if (!state.sourcePath || state.busy) return;
+  scheduleMeshBuild(state.sourcePath, false, captureHandleSnapshot());
+});
+
+exampleButton.addEventListener("click", () => {
+  if (!state.busy) loadExample(true);
+});
+clearButton.addEventListener("click", () => {
+  if (!state.busy) clearShape();
+});
 window.addEventListener("resize", resizeCanvas);
 
+updateResolutionDisplay();
 await init();
 state.wasmReady = true;
 resizeCanvas();
-loadExample();
+loadExample(false);
