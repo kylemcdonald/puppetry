@@ -8,6 +8,7 @@ import {
   Trash2,
   createIcons,
 } from "lucide";
+import cdt2d from "cdt2d";
 import init, { WasmArap } from "../pkg/arap2d.js";
 import "./styles.css";
 
@@ -18,6 +19,10 @@ const toolButtons = [...document.querySelectorAll(".tool[data-mode]")];
 const meshToggle = document.querySelector("#meshToggle");
 const exampleButton = document.querySelector("#exampleButton");
 const clearButton = document.querySelector("#clearButton");
+const DRAW_SAMPLE_SPACING = 4;
+const DOUGLAS_PEUCKER_EPSILON = 5;
+const BOUNDARY_MAX_SEGMENT = 24;
+const MAX_BOUNDARY_POINTS = 96;
 
 createIcons({
   icons: {
@@ -66,6 +71,21 @@ function pointerPoint(event) {
   return { x: event.clientX - rect.left, y: event.clientY - rect.top };
 }
 
+function appendDrawPoint(point) {
+  const last = state.drawPath[state.drawPath.length - 1];
+  if (!last) {
+    state.drawPath.push(point);
+    return true;
+  }
+  const length = dist(last, point);
+  if (length < DRAW_SAMPLE_SPACING) return false;
+  const steps = Math.floor(length / DRAW_SAMPLE_SPACING);
+  for (let step = 1; step <= steps; step++) {
+    state.drawPath.push(interpolate(last, point, (step * DRAW_SAMPLE_SPACING) / length));
+  }
+  return true;
+}
+
 function dist(a, b) {
   const dx = a.x - b.x;
   const dy = a.y - b.y;
@@ -82,30 +102,115 @@ function polygonArea(points) {
   return area * 0.5;
 }
 
-function simplifyPath(points, spacing = 9) {
+function removeClosingDuplicate(points, epsilon = 1) {
+  if (points.length > 2 && dist(points[0], points[points.length - 1]) <= epsilon) {
+    return points.slice(0, -1);
+  }
+  return points;
+}
+
+function dedupeConsecutivePoints(points, epsilon = 0.5) {
   const out = [];
   for (const p of points) {
-    if (!out.length || dist(out[out.length - 1], p) >= spacing) {
+    if (!out.length || dist(out[out.length - 1], p) > epsilon) {
       out.push(p);
     }
   }
-  if (out.length > 2 && dist(out[0], out[out.length - 1]) < spacing * 1.5) {
-    out.pop();
+  return removeClosingDuplicate(out, epsilon);
+}
+
+function interpolate(a, b, t) {
+  return {
+    x: a.x + (b.x - a.x) * t,
+    y: a.y + (b.y - a.y) * t,
+  };
+}
+
+function densifyClosedPath(points, spacing) {
+  if (points.length < 2) return points;
+  const out = [];
+  for (let i = 0; i < points.length; i++) {
+    const a = points[i];
+    const b = points[(i + 1) % points.length];
+    const length = dist(a, b);
+    const steps = Math.max(1, Math.ceil(length / spacing));
+    out.push(a);
+    for (let step = 1; step < steps; step++) {
+      out.push(interpolate(a, b, step / steps));
+    }
   }
   return out;
 }
 
-function uniquePoints(points, precision = 1000) {
-  const seen = new Set();
+function perpendicularDistanceToSegment(p, a, b) {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const lengthSq = dx * dx + dy * dy;
+  if (lengthSq < 1e-9) return dist(p, a);
+  const t = Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / lengthSq));
+  return dist(p, { x: a.x + dx * t, y: a.y + dy * t });
+}
+
+function douglasPeuckerOpen(points, epsilon) {
+  if (points.length <= 2) return points;
+  let maxDistance = -1;
+  let splitIndex = 0;
+  const first = points[0];
+  const last = points[points.length - 1];
+  for (let i = 1; i < points.length - 1; i++) {
+    const d = perpendicularDistanceToSegment(points[i], first, last);
+    if (d > maxDistance) {
+      maxDistance = d;
+      splitIndex = i;
+    }
+  }
+  if (maxDistance <= epsilon) return [first, last];
+  const left = douglasPeuckerOpen(points.slice(0, splitIndex + 1), epsilon);
+  const right = douglasPeuckerOpen(points.slice(splitIndex), epsilon);
+  return left.slice(0, -1).concat(right);
+}
+
+function douglasPeuckerClosed(points, epsilon) {
+  if (points.length <= 3) return points;
+  const center = polygonCentroid(points);
+  let startIndex = 0;
+  let startDistance = -1;
+  points.forEach((p, i) => {
+    const d = dist(p, center);
+    if (d > startDistance) {
+      startDistance = d;
+      startIndex = i;
+    }
+  });
+  const rotated = points.slice(startIndex).concat(points.slice(0, startIndex));
+  const simplified = douglasPeuckerOpen([...rotated, rotated[0]], epsilon);
+  const closed = removeClosingDuplicate(simplified, 1e-6);
+  return closed.length >= 3 ? closed : points;
+}
+
+function subdivideLongBoundarySegments(points, maxSegmentLength, maxPoints) {
+  if (points.length < 2) return points;
   const out = [];
-  for (const p of points) {
-    const key = `${Math.round(p.x * precision)}:${Math.round(p.y * precision)}`;
-    if (!seen.has(key)) {
-      seen.add(key);
-      out.push(p);
+  const perimeter = points.reduce((sum, p, i) => sum + dist(p, points[(i + 1) % points.length]), 0);
+  const scale = Math.max(1, perimeter / (maxSegmentLength * maxPoints));
+  for (let i = 0; i < points.length; i++) {
+    const a = points[i];
+    const b = points[(i + 1) % points.length];
+    const steps = Math.max(1, Math.ceil(dist(a, b) / (maxSegmentLength * scale)));
+    out.push(a);
+    for (let step = 1; step < steps; step++) {
+      out.push(interpolate(a, b, step / steps));
     }
   }
   return out;
+}
+
+function simplifyDrawnBoundary(points) {
+  const cleaned = dedupeConsecutivePoints(points);
+  if (cleaned.length < 3) return cleaned;
+  const dense = densifyClosedPath(cleaned, DRAW_SAMPLE_SPACING);
+  const simplified = removeNearCollinear(douglasPeuckerClosed(dense, DOUGLAS_PEUCKER_EPSILON));
+  return subdivideLongBoundarySegments(simplified, BOUNDARY_MAX_SEGMENT, MAX_BOUNDARY_POINTS);
 }
 
 function removeNearCollinear(points, epsilon = 0.015) {
@@ -147,49 +252,68 @@ function polygonCentroid(points) {
   return { x: cx / (3 * area2), y: cy / (3 * area2) };
 }
 
-function ringScales(boundaryCount) {
-  if (boundaryCount <= 10) return [1, 0.7, 0.43, 0.18];
-  if (boundaryCount <= 28) return [1, 0.64, 0.3];
-  return [1, 0.48];
+function pointInPolygon(point, polygon) {
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const a = polygon[i];
+    const b = polygon[j];
+    if ((a.y > point.y) !== (b.y > point.y)) {
+      const x = ((b.x - a.x) * (point.y - a.y)) / (b.y - a.y) + a.x;
+      if (point.x < x) inside = !inside;
+    }
+  }
+  return inside;
+}
+
+function distanceToBoundary(point, boundary) {
+  let best = Infinity;
+  for (let i = 0; i < boundary.length; i++) {
+    best = Math.min(best, perpendicularDistanceToSegment(point, boundary[i], boundary[(i + 1) % boundary.length]));
+  }
+  return best;
+}
+
+function boundaryBounds(boundary) {
+  return boundary.reduce(
+    (box, p) => ({
+      minX: Math.min(box.minX, p.x),
+      minY: Math.min(box.minY, p.y),
+      maxX: Math.max(box.maxX, p.x),
+      maxY: Math.max(box.maxY, p.y),
+    }),
+    { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity },
+  );
+}
+
+function interiorSampleSpacing(boundary) {
+  const area = Math.max(1, Math.abs(polygonArea(boundary)));
+  return Math.max(34, Math.min(58, Math.sqrt(area) / 6));
+}
+
+function addInteriorSamples(vertices, boundary) {
+  const box = boundaryBounds(boundary);
+  const spacing = interiorSampleSpacing(boundary);
+  const rowHeight = spacing * Math.sqrt(3) * 0.5;
+  const clearance = spacing * 0.38;
+  let row = 0;
+  for (let y = box.minY + rowHeight * 0.5; y <= box.maxY - rowHeight * 0.25; y += rowHeight) {
+    const offset = row % 2 === 0 ? spacing * 0.5 : 0;
+    for (let x = box.minX + offset; x <= box.maxX; x += spacing) {
+      const p = { x, y };
+      if (pointInPolygon(p, boundary) && distanceToBoundary(p, boundary) > clearance) {
+        vertices.push(p);
+      }
+    }
+    row += 1;
+  }
 }
 
 function buildButterflyControlMesh(boundary) {
-  const center = polygonCentroid(boundary);
-  const scales = ringScales(boundary.length);
-  const vertices = [];
-  const ringIndices = [];
-  for (const scale of scales) {
-    const ring = [];
-    for (const p of boundary) {
-      ring.push(vertices.length);
-      vertices.push({
-        x: center.x + (p.x - center.x) * scale,
-        y: center.y + (p.y - center.y) * scale,
-      });
-    }
-    ringIndices.push(ring);
-  }
-  const triangles = [];
-  for (let r = 0; r < ringIndices.length - 1; r++) {
-    const outer = ringIndices[r];
-    const inner = ringIndices[r + 1];
-    for (let i = 0; i < boundary.length; i++) {
-      const next = (i + 1) % boundary.length;
-      if ((i + r) % 2 === 0) {
-        triangles.push([outer[i], outer[next], inner[next]]);
-        triangles.push([outer[i], inner[next], inner[i]]);
-      } else {
-        triangles.push([outer[i], outer[next], inner[i]]);
-        triangles.push([outer[next], inner[next], inner[i]]);
-      }
-    }
-  }
-  const centerIndex = vertices.length;
-  vertices.push(center);
-  const inner = ringIndices[ringIndices.length - 1];
-  for (let i = 0; i < boundary.length; i++) {
-    triangles.push([inner[i], inner[(i + 1) % boundary.length], centerIndex]);
-  }
+  const vertices = boundary.map((p) => ({ x: p.x, y: p.y }));
+  addInteriorSamples(vertices, boundary);
+  const points = vertices.map((p) => [p.x, p.y]);
+  const edges = boundary.map((_, i) => [i, (i + 1) % boundary.length]);
+  const triangles = cdt2d(points, edges, { exterior: false, delaunay: true });
   return {
     vertices,
     triangles,
@@ -316,7 +440,7 @@ function butterflyIterationCount(seedTriangleCount) {
 }
 
 function triangulatePolygon(rawPath) {
-  let boundary = removeNearCollinear(uniquePoints(simplifyPath(rawPath, 7)));
+  let boundary = simplifyDrawnBoundary(rawPath);
   if (boundary.length < 3) return null;
   if (polygonArea(boundary) < 0) boundary = boundary.slice().reverse();
   const controlMesh = buildButterflyControlMesh(boundary);
@@ -556,7 +680,8 @@ canvas.addEventListener("pointerdown", (event) => {
   const p = pointerPoint(event);
   if (state.mode === "draw") {
     state.drawing = true;
-    state.drawPath = [p];
+    state.drawPath = [];
+    appendDrawPoint(p);
     draw();
     return;
   }
@@ -585,10 +710,7 @@ canvas.addEventListener("pointerdown", (event) => {
 canvas.addEventListener("pointermove", (event) => {
   const p = pointerPoint(event);
   if (state.drawing) {
-    if (dist(state.drawPath[state.drawPath.length - 1], p) > 5) {
-      state.drawPath.push(p);
-      draw();
-    }
+    if (appendDrawPoint(p)) draw();
     return;
   }
   if (state.draggingControl != null) {
@@ -601,6 +723,7 @@ canvas.addEventListener("pointerup", (event) => {
   canvas.releasePointerCapture(event.pointerId);
   if (state.drawing) {
     state.drawing = false;
+    appendDrawPoint(pointerPoint(event));
     const mesh = triangulatePolygon(state.drawPath);
     state.drawPath = [];
     if (mesh) installMesh(mesh);
