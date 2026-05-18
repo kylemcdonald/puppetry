@@ -1,4 +1,4 @@
-import Delaunator from "delaunator";
+import { Point as PolyPoint, SweepContext } from "poly2tri";
 import {
   CircleDot,
   Grid,
@@ -135,8 +135,26 @@ function uniquePoints(points, precision = 1000) {
   return out;
 }
 
+function removeNearCollinear(points, epsilon = 0.015) {
+  if (points.length < 4) return points;
+  const out = [];
+  for (let i = 0; i < points.length; i++) {
+    const prev = points[(i - 1 + points.length) % points.length];
+    const curr = points[i];
+    const next = points[(i + 1) % points.length];
+    const ux = curr.x - prev.x;
+    const uy = curr.y - prev.y;
+    const vx = next.x - curr.x;
+    const vy = next.y - curr.y;
+    const cross = Math.abs(ux * vy - uy * vx);
+    const scale = Math.max(1, Math.hypot(ux, uy) * Math.hypot(vx, vy));
+    if (cross / scale > epsilon || dist(prev, next) < 1) out.push(curr);
+  }
+  return out.length >= 3 ? out : points;
+}
+
 function triangulatePolygon(rawPath) {
-  let polygon = simplifyPath(rawPath, 12);
+  let polygon = removeNearCollinear(simplifyPath(rawPath, 7));
   if (polygon.length < 3) return null;
   if (polygonArea(polygon) < 0) polygon = polygon.slice().reverse();
   const bounds = polygon.reduce(
@@ -150,51 +168,36 @@ function triangulatePolygon(rawPath) {
   );
   const longest = Math.max(bounds.maxX - bounds.minX, bounds.maxY - bounds.minY);
   const spacing = Math.max(22, Math.min(42, longest / 14));
-  const points = sampleBoundary(polygon, spacing);
+  const boundary = removeNearCollinear(uniquePoints(sampleBoundary(polygon, Math.max(8, spacing * 0.55))));
+  if (boundary.length < 3) return null;
+  if (polygonArea(boundary) < 0) boundary.reverse();
+  const steiner = [];
   for (let y = bounds.minY + spacing * 0.65; y < bounds.maxY; y += spacing) {
     for (let x = bounds.minX + spacing * 0.65; x < bounds.maxX; x += spacing) {
       const p = { x, y };
-      if (pointInPolygon(p, polygon)) points.push(p);
+      if (pointInPolygon(p, boundary)) steiner.push(p);
     }
   }
-  const vertices = uniquePoints(points);
-  if (vertices.length < 3) return null;
-  const delaunay = Delaunator.from(
-    vertices,
-    (p) => p.x,
-    (p) => p.y,
-  );
-  const triangles = [];
-  for (let i = 0; i < delaunay.triangles.length; i += 3) {
-    const tri = [delaunay.triangles[i], delaunay.triangles[i + 1], delaunay.triangles[i + 2]];
-    const a = vertices[tri[0]];
-    const b = vertices[tri[1]];
-    const c = vertices[tri[2]];
-    const centroid = { x: (a.x + b.x + c.x) / 3, y: (a.y + b.y + c.y) / 3 };
-    const ab = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
-    const bc = { x: (b.x + c.x) / 2, y: (b.y + c.y) / 2 };
-    const ca = { x: (c.x + a.x) / 2, y: (c.y + a.y) / 2 };
-    const area = Math.abs(polygonArea([a, b, c]));
-    if (
-      area > 1e-4 &&
-      pointInPolygon(centroid, polygon) &&
-      pointInPolygon(ab, polygon) &&
-      pointInPolygon(bc, polygon) &&
-      pointInPolygon(ca, polygon)
-    ) {
-      triangles.push(tri);
-    }
+  const contourPoints = boundary.map((p) => new PolyPoint(p.x, p.y));
+  const steinerPoints = uniquePoints(steiner).map((p) => new PolyPoint(p.x, p.y));
+  try {
+    const sweep = new SweepContext(contourPoints);
+    if (steinerPoints.length) sweep.addPoints(steinerPoints);
+    sweep.triangulate();
+    const allPoints = [...contourPoints, ...steinerPoints];
+    const indices = new Map(allPoints.map((p, i) => [p, i]));
+    const vertices = allPoints.map((p) => ({ x: p.x, y: p.y }));
+    const triangles = sweep
+      .getTriangles()
+      .map((triangle) => [0, 1, 2].map((i) => indices.get(triangle.getPoint(i))))
+      .filter((tri) => tri.every((idx) => idx != null))
+      .filter((tri) => Math.abs(polygonArea(tri.map((idx) => vertices[idx]))) > 1e-4);
+    if (vertices.length < 3 || triangles.length < 1) return null;
+    return { vertices, triangles, polygon: boundary };
+  } catch (error) {
+    console.warn("Constrained triangulation failed", error);
+    return null;
   }
-  const used = new Set(triangles.flat());
-  const remap = new Map();
-  const compactVertices = [];
-  for (const oldIndex of [...used].sort((a, b) => a - b)) {
-    remap.set(oldIndex, compactVertices.length);
-    compactVertices.push(vertices[oldIndex]);
-  }
-  const compactTriangles = triangles.map((tri) => tri.map((idx) => remap.get(idx)));
-  if (compactVertices.length < 3 || compactTriangles.length < 1) return null;
-  return { vertices: compactVertices, triangles: compactTriangles, polygon };
 }
 
 function flattenVertices(vertices) {
@@ -323,15 +326,15 @@ function installMesh(mesh, autoHandles = false) {
   state.solver = null;
   state.dirtySolver = true;
   if (autoHandles) {
-    const minX = Math.min(...mesh.vertices.map((p) => p.x));
-    const maxX = Math.max(...mesh.vertices.map((p) => p.x));
     const left = mesh.vertices
       .map((p, i) => ({ p, i }))
-      .filter(({ p }) => p.x < minX + 12)
+      .sort((a, b) => a.p.x - b.p.x)
+      .slice(0, 3)
       .map(({ i }) => i);
     const right = mesh.vertices
       .map((p, i) => ({ p, i }))
-      .filter(({ p }) => p.x > maxX - 12)
+      .sort((a, b) => b.p.x - a.p.x)
+      .slice(0, 3)
       .map(({ i }) => i);
     left.forEach((idx) => state.anchors.add(idx));
     right.forEach((idx) => {
