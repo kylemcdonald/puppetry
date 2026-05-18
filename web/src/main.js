@@ -1,4 +1,3 @@
-import { Point as PolyPoint, SweepContext } from "poly2tri";
 import {
   CircleDot,
   Grid,
@@ -83,17 +82,6 @@ function polygonArea(points) {
   return area * 0.5;
 }
 
-function pointInPolygon(p, polygon) {
-  let inside = false;
-  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
-    const a = polygon[i];
-    const b = polygon[j];
-    const intersects = a.y > p.y !== b.y > p.y && p.x < ((b.x - a.x) * (p.y - a.y)) / (b.y - a.y) + a.x;
-    if (intersects) inside = !inside;
-  }
-  return inside;
-}
-
 function simplifyPath(points, spacing = 9) {
   const out = [];
   for (const p of points) {
@@ -105,21 +93,6 @@ function simplifyPath(points, spacing = 9) {
     out.pop();
   }
   return out;
-}
-
-function sampleBoundary(points, spacing) {
-  const samples = [];
-  for (let i = 0; i < points.length; i++) {
-    const a = points[i];
-    const b = points[(i + 1) % points.length];
-    const length = dist(a, b);
-    const steps = Math.max(1, Math.ceil(length / spacing));
-    for (let s = 0; s < steps; s++) {
-      const t = s / steps;
-      samples.push({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
-    }
-  }
-  return samples;
 }
 
 function uniquePoints(points, precision = 1000) {
@@ -151,6 +124,51 @@ function removeNearCollinear(points, epsilon = 0.015) {
     if (cross / scale > epsilon || dist(prev, next) < 1) out.push(curr);
   }
   return out.length >= 3 ? out : points;
+}
+
+function signedTriangleArea(a, b, c) {
+  return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+}
+
+function pointInTriangle(p, a, b, c, epsilon = 1e-7) {
+  const ab = signedTriangleArea(a, b, p);
+  const bc = signedTriangleArea(b, c, p);
+  const ca = signedTriangleArea(c, a, p);
+  return ab >= -epsilon && bc >= -epsilon && ca >= -epsilon;
+}
+
+function earClipPolygon(vertices) {
+  const indices = vertices.map((_, i) => i);
+  const triangles = [];
+  let guard = vertices.length * vertices.length;
+  while (indices.length > 3 && guard-- > 0) {
+    let clipped = false;
+    for (let i = 0; i < indices.length; i++) {
+      const prev = indices[(i - 1 + indices.length) % indices.length];
+      const curr = indices[i];
+      const next = indices[(i + 1) % indices.length];
+      const a = vertices[prev];
+      const b = vertices[curr];
+      const c = vertices[next];
+      if (signedTriangleArea(a, b, c) <= 1e-7) continue;
+      let containsOtherVertex = false;
+      for (const idx of indices) {
+        if (idx === prev || idx === curr || idx === next) continue;
+        if (pointInTriangle(vertices[idx], a, b, c)) {
+          containsOtherVertex = true;
+          break;
+        }
+      }
+      if (containsOtherVertex) continue;
+      triangles.push([prev, curr, next]);
+      indices.splice(i, 1);
+      clipped = true;
+      break;
+    }
+    if (!clipped) return null;
+  }
+  if (indices.length === 3) triangles.push([indices[0], indices[1], indices[2]]);
+  return triangles.length ? triangles : null;
 }
 
 function edgeKey(a, b) {
@@ -241,51 +259,23 @@ function butterflySubdivision(mesh, iterations = 1) {
   return { vertices, triangles, polygon: mesh.polygon };
 }
 
+function butterflyIterationCount(seedTriangleCount) {
+  let iterations = 1;
+  let triangleCount = seedTriangleCount * 4;
+  while (triangleCount < 260 && iterations < 3) {
+    iterations += 1;
+    triangleCount *= 4;
+  }
+  return iterations;
+}
+
 function triangulatePolygon(rawPath) {
-  let polygon = removeNearCollinear(simplifyPath(rawPath, 7));
-  if (polygon.length < 3) return null;
-  if (polygonArea(polygon) < 0) polygon = polygon.slice().reverse();
-  const bounds = polygon.reduce(
-    (acc, p) => ({
-      minX: Math.min(acc.minX, p.x),
-      minY: Math.min(acc.minY, p.y),
-      maxX: Math.max(acc.maxX, p.x),
-      maxY: Math.max(acc.maxY, p.y),
-    }),
-    { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity },
-  );
-  const longest = Math.max(bounds.maxX - bounds.minX, bounds.maxY - bounds.minY);
-  const spacing = Math.max(22, Math.min(42, longest / 14));
-  const boundary = removeNearCollinear(uniquePoints(sampleBoundary(polygon, Math.max(8, spacing * 0.55))));
+  let boundary = removeNearCollinear(uniquePoints(simplifyPath(rawPath, 7)));
   if (boundary.length < 3) return null;
-  if (polygonArea(boundary) < 0) boundary.reverse();
-  const steiner = [];
-  for (let y = bounds.minY + spacing * 0.65; y < bounds.maxY; y += spacing) {
-    for (let x = bounds.minX + spacing * 0.65; x < bounds.maxX; x += spacing) {
-      const p = { x, y };
-      if (pointInPolygon(p, boundary)) steiner.push(p);
-    }
-  }
-  const contourPoints = boundary.map((p) => new PolyPoint(p.x, p.y));
-  const steinerPoints = uniquePoints(steiner).map((p) => new PolyPoint(p.x, p.y));
-  try {
-    const sweep = new SweepContext(contourPoints);
-    if (steinerPoints.length) sweep.addPoints(steinerPoints);
-    sweep.triangulate();
-    const allPoints = [...contourPoints, ...steinerPoints];
-    const indices = new Map(allPoints.map((p, i) => [p, i]));
-    const vertices = allPoints.map((p) => ({ x: p.x, y: p.y }));
-    const triangles = sweep
-      .getTriangles()
-      .map((triangle) => [0, 1, 2].map((i) => indices.get(triangle.getPoint(i))))
-      .filter((tri) => tri.every((idx) => idx != null))
-      .filter((tri) => Math.abs(polygonArea(tri.map((idx) => vertices[idx]))) > 1e-4);
-    if (vertices.length < 3 || triangles.length < 1) return null;
-    return butterflySubdivision({ vertices, triangles, polygon: boundary }, 1);
-  } catch (error) {
-    console.warn("Constrained triangulation failed", error);
-    return null;
-  }
+  if (polygonArea(boundary) < 0) boundary = boundary.slice().reverse();
+  const triangles = earClipPolygon(boundary);
+  if (!triangles) return null;
+  return butterflySubdivision({ vertices: boundary, triangles, polygon: boundary }, butterflyIterationCount(triangles.length));
 }
 
 function flattenVertices(vertices) {
